@@ -25,6 +25,8 @@ import (
 	"github.com/mitchellh/cli"
 	"github.com/mitchellh/colorstring"
 	"github.com/zclconf/go-cty/cty"
+
+	backendLocal "github.com/hashicorp/terraform/backend/local"
 )
 
 const (
@@ -49,27 +51,32 @@ type Remote struct {
 	// Operation. See Operation for more details.
 	ContextOpts *terraform.ContextOpts
 
-	// client is the remote backend API client
+	// client is the remote backend API client.
 	client *tfe.Client
 
-	// hostname of the remote backend server
+	// hostname of the remote backend server.
 	hostname string
 
-	// organization is the organization that contains the target workspaces
+	// organization is the organization that contains the target workspaces.
 	organization string
 
-	// workspace is used to map the default workspace to a remote workspace
+	// workspace is used to map the default workspace to a remote workspace.
 	workspace string
 
-	// prefix is used to filter down a set of workspaces that use a single
+	// prefix is used to filter down a set of workspaces that use a single.
 	// configuration
 	prefix string
 
-	// schema defines the configuration for the backend
+	// schema defines the configuration for the backend.
 	schema *schema.Backend
 
 	// services is used for service discovery
 	services *disco.Disco
+
+	// local, if non-nil, will be used for all enhanced behavior. This
+	// allows local behavior with the remote backend functioning as remote
+	// state storage backend.
+	local backend.Enhanced
 
 	// opLock locks operations
 	opLock sync.Mutex
@@ -84,6 +91,7 @@ func New(services *disco.Disco) *Remote {
 	}
 }
 
+// ConfigSchema implements backend.Enhanced.
 func (b *Remote) ConfigSchema() *configschema.Block {
 	return &configschema.Block{
 		Attributes: map[string]*configschema.Attribute{
@@ -126,6 +134,7 @@ func (b *Remote) ConfigSchema() *configschema.Block {
 	}
 }
 
+// ValidateConfig implements backend.Enhanced.
 func (b *Remote) ValidateConfig(obj cty.Value) tfdiags.Diagnostics {
 	var diags tfdiags.Diagnostics
 
@@ -173,6 +182,7 @@ func (b *Remote) ValidateConfig(obj cty.Value) tfdiags.Diagnostics {
 	return diags
 }
 
+// Configure implements backend.Enhanced.
 func (b *Remote) Configure(obj cty.Value) tfdiags.Diagnostics {
 	var diags tfdiags.Diagnostics
 
@@ -255,6 +265,28 @@ func (b *Remote) Configure(obj cty.Value) tfdiags.Diagnostics {
 					`Terraform Enterprise client: %s.`, err,
 			),
 		))
+		return diags
+	}
+
+	// Retrieve the organization entitlements.
+	_, err = b.client.Organizations.Read(context.Background(), b.organization)
+	if err != nil {
+		if err == tfe.ErrResourceNotFound {
+			err = fmt.Errorf("organization %s does not exist", b.organization)
+		}
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Failed to read organization settings",
+			fmt.Sprintf(
+				`The "remote" backend encountered an unexpected error while reading the `+
+					`organization settings: %s.`, err,
+			),
+		))
+		return diags
+	}
+
+	if os.Getenv("TF_FORCE_LOCAL_BACKEND") != "" {
+		b.local = backendLocal.NewWithBackend(b)
 	}
 
 	return diags
@@ -292,103 +324,7 @@ func (b *Remote) token(hostname string) (string, error) {
 	return "", nil
 }
 
-// Workspaces returns a filtered list of remote workspace names.
-func (b *Remote) Workspaces() ([]string, error) {
-	if b.prefix == "" {
-		return nil, backend.ErrWorkspacesNotSupported
-	}
-	return b.workspaces()
-}
-
-func (b *Remote) workspaces() ([]string, error) {
-	// Check if the configured organization exists.
-	_, err := b.client.Organizations.Read(context.Background(), b.organization)
-	if err != nil {
-		if err == tfe.ErrResourceNotFound {
-			return nil, fmt.Errorf("organization %s does not exist", b.organization)
-		}
-		return nil, err
-	}
-
-	options := tfe.WorkspaceListOptions{}
-	switch {
-	case b.workspace != "":
-		options.Search = tfe.String(b.workspace)
-	case b.prefix != "":
-		options.Search = tfe.String(b.prefix)
-	}
-
-	// Create a slice to contain all the names.
-	var names []string
-
-	for {
-		wl, err := b.client.Workspaces.List(context.Background(), b.organization, options)
-		if err != nil {
-			return nil, err
-		}
-
-		for _, w := range wl.Items {
-			if b.workspace != "" && w.Name == b.workspace {
-				names = append(names, backend.DefaultStateName)
-				continue
-			}
-			if b.prefix != "" && strings.HasPrefix(w.Name, b.prefix) {
-				names = append(names, strings.TrimPrefix(w.Name, b.prefix))
-			}
-		}
-
-		// Exit the loop when we've seen all pages.
-		if wl.CurrentPage >= wl.TotalPages {
-			break
-		}
-
-		// Update the page number to get the next page.
-		options.PageNumber = wl.NextPage
-	}
-
-	// Sort the result so we have consistent output.
-	sort.StringSlice(names).Sort()
-
-	return names, nil
-}
-
-// DeleteWorkspace removes the remote workspace if it exists.
-func (b *Remote) DeleteWorkspace(name string) error {
-	if b.workspace == "" && name == backend.DefaultStateName {
-		return backend.ErrDefaultWorkspaceNotSupported
-	}
-	if b.prefix == "" && name != backend.DefaultStateName {
-		return backend.ErrWorkspacesNotSupported
-	}
-
-	// Configure the remote workspace name.
-	switch {
-	case name == backend.DefaultStateName:
-		name = b.workspace
-	case b.prefix != "" && !strings.HasPrefix(name, b.prefix):
-		name = b.prefix + name
-	}
-
-	// Check if the configured organization exists.
-	_, err := b.client.Organizations.Read(context.Background(), b.organization)
-	if err != nil {
-		if err == tfe.ErrResourceNotFound {
-			return fmt.Errorf("organization %s does not exist", b.organization)
-		}
-		return err
-	}
-
-	client := &remoteClient{
-		client:       b.client,
-		organization: b.organization,
-		workspace:    name,
-	}
-
-	return client.Delete()
-}
-
-// StateMgr returns the latest state of the given remote workspace. The
-// workspace will be created if it doesn't exist.
+// StateMgr implements backend.Enhanced.
 func (b *Remote) StateMgr(name string) (state.State, error) {
 	if b.workspace == "" && name == backend.DefaultStateName {
 		return nil, backend.ErrDefaultWorkspaceNotSupported
@@ -447,8 +383,90 @@ func (b *Remote) StateMgr(name string) (state.State, error) {
 	return &remote.State{Client: client}, nil
 }
 
-// Operation implements backend.Enhanced
+// DeleteWorkspace implements backend.Enhanced.
+func (b *Remote) DeleteWorkspace(name string) error {
+	if b.workspace == "" && name == backend.DefaultStateName {
+		return backend.ErrDefaultWorkspaceNotSupported
+	}
+	if b.prefix == "" && name != backend.DefaultStateName {
+		return backend.ErrWorkspacesNotSupported
+	}
+
+	// Configure the remote workspace name.
+	switch {
+	case name == backend.DefaultStateName:
+		name = b.workspace
+	case b.prefix != "" && !strings.HasPrefix(name, b.prefix):
+		name = b.prefix + name
+	}
+
+	client := &remoteClient{
+		client:       b.client,
+		organization: b.organization,
+		workspace:    name,
+	}
+
+	return client.Delete()
+}
+
+// Workspaces implements backend.Enhanced.
+func (b *Remote) Workspaces() ([]string, error) {
+	if b.prefix == "" {
+		return nil, backend.ErrWorkspacesNotSupported
+	}
+	return b.workspaces()
+}
+
+// workspaces returns a filtered list of remote workspace names.
+func (b *Remote) workspaces() ([]string, error) {
+	options := tfe.WorkspaceListOptions{}
+	switch {
+	case b.workspace != "":
+		options.Search = tfe.String(b.workspace)
+	case b.prefix != "":
+		options.Search = tfe.String(b.prefix)
+	}
+
+	// Create a slice to contain all the names.
+	var names []string
+
+	for {
+		wl, err := b.client.Workspaces.List(context.Background(), b.organization, options)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, w := range wl.Items {
+			if b.workspace != "" && w.Name == b.workspace {
+				names = append(names, backend.DefaultStateName)
+				continue
+			}
+			if b.prefix != "" && strings.HasPrefix(w.Name, b.prefix) {
+				names = append(names, strings.TrimPrefix(w.Name, b.prefix))
+			}
+		}
+
+		// Exit the loop when we've seen all pages.
+		if wl.CurrentPage >= wl.TotalPages {
+			break
+		}
+
+		// Update the page number to get the next page.
+		options.PageNumber = wl.NextPage
+	}
+
+	// Sort the result so we have consistent output.
+	sort.StringSlice(names).Sort()
+
+	return names, nil
+}
+
+// Operation implements backend.Enhanced.
 func (b *Remote) Operation(ctx context.Context, op *backend.Operation) (*backend.RunningOperation, error) {
+	if b.local != nil {
+		return b.local.Operation(ctx, op)
+	}
+
 	// Configure the remote workspace name.
 	switch {
 	case op.Workspace == backend.DefaultStateName:

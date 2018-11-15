@@ -250,8 +250,6 @@ func (b *Local) DeleteWorkspace(name string) error {
 }
 
 func (b *Local) StateMgr(name string) (statemgr.Full, error) {
-	statePath, stateOutPath, backupPath := b.StatePaths(name)
-
 	// If we have a backend handling state, delegate to that.
 	if b.Backend != nil {
 		return b.Backend.StateMgr(name)
@@ -264,6 +262,8 @@ func (b *Local) StateMgr(name string) (statemgr.Full, error) {
 	if err := b.createState(name); err != nil {
 		return nil, err
 	}
+
+	statePath, stateOutPath, backupPath := b.StatePaths(name)
 
 	s := statemgr.NewFilesystemBetweenPaths(statePath, stateOutPath)
 	if backupPath != "" {

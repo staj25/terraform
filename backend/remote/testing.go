@@ -141,6 +141,49 @@ func testServer(t *testing.T) *httptest.Server {
 		io.WriteString(w, `{"tfe.v2":"/api/v2/"}`)
 	})
 
+	// Respond to the initial query to read the organization settings.
+	mux.HandleFunc("/api/v2/organizations/hashicorp", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.api+json")
+		io.WriteString(w, `{
+  "data": {
+    "id": "hashicorp",
+    "type": "organizations",
+    "attributes": {
+      "name": "hashicorp",
+      "created-at": "2017-09-07T14:34:40.492Z",
+      "email": "user@example.com",
+      "collaborator-auth-policy": "password",
+      "enterprise-plan": "premium",
+      "permissions": {
+        "can-update": true,
+        "can-destroy": true,
+        "can-create-team": true,
+        "can-create-workspace": true,
+        "can-update-oauth": true,
+        "can-update-api-token": true,
+        "can-update-sentinel": true,
+        "can-traverse": true,
+        "can-create-workspace-migration": true
+      }
+    }
+  }
+}`)
+	})
+
+	// All tests that are assumed to pass will use the hashicorp organization,
+	// so for all other organization requests we will return a 404.
+	mux.HandleFunc("/api/v2/organizations/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(404)
+		io.WriteString(w, `{
+  "errors": [
+    {
+      "status": "404",
+      "title": "not found"
+    }
+  ]
+}`)
+	})
+
 	return httptest.NewServer(mux)
 }
 
