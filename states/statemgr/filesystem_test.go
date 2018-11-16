@@ -57,7 +57,7 @@ func TestFilesystemLocks(t *testing.T) {
 		t.Fatal("unexpected lock failure", err, string(out))
 	}
 
-	if string(out) != "lock failed" {
+	if !strings.Contains(string(out), "lock failed") {
 		t.Fatal("expected 'locked failed', got", string(out))
 	}
 

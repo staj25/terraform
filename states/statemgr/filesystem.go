@@ -1,10 +1,8 @@
 package statemgr
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"log"
 	"os"
@@ -218,64 +216,57 @@ func (s *Filesystem) PersistState() error {
 func (s *Filesystem) RefreshState() error {
 	defer s.mutex()()
 
-	var reader io.Reader
+	log.Printf("[TRACE] statemgr.Filesystem: reading snapshot from %s", s.path)
 
-	// The s.readPath file is only OK to read if we have not written any state out
-	// (in which case the same state needs to be read in), and no state output file
-	// has been opened (possibly via a lock) or the input path is different
-	// than the output path.
-	// This is important for Windows, as if the input file is the same as the
-	// output file, and the output file has been locked already, we can't open
-	// the file again.
-	if !s.written && (s.stateFileOut == nil || s.readPath != s.path) {
-		log.Printf("[TRACE] statemgr.Filesystem: reading initial snapshot from %s", s.readPath)
-
-		// we haven't written a state file yet, so load from readPath
-		f, err := os.Open(s.readPath)
-		if err != nil {
-			// It is okay if the file doesn't exist; we'll treat that as a nil state.
-			if !os.IsNotExist(err) {
-				return err
-			}
-
-			// we need a non-nil reader for ReadState and an empty buffer works
-			// to return EOF immediately
-			reader = bytes.NewBuffer(nil)
-
-		} else {
-			defer f.Close()
-			reader = f
+	if s.stateFileOut == nil {
+		if err := s.createStateFiles(); err != nil {
+			return err
 		}
-	} else {
-		log.Printf("[TRACE] statemgr.Filesystem: reading snapshot from %s", s.path)
-
-		// no state to refresh
-		if s.stateFileOut == nil {
-			log.Printf("[TRACE] statemgr.Filesystem: no state snapshot has been written yet")
-			return nil
-		}
-
-		// we have a state file, make sure we're at the start
-		s.stateFileOut.Seek(0, os.SEEK_SET)
-		reader = s.stateFileOut
 	}
 
-	f, err := statefile.Read(reader)
-
-	// nothing to backup if there's no initial state
-	if f == nil {
-		log.Printf("[TRACE] statemgr.Filesystem: no initial state, so will skip writing a backup")
-		s.writtenBackup = true
+	// we have a state file, make sure we're at the start
+	_, err := s.stateFileOut.Seek(0, os.SEEK_SET)
+	if err != nil {
+		return err
 	}
+	f, err := statefile.Read(s.stateFileOut)
 
 	// if there's no state we just assign the nil return value
 	if err != nil && err != statefile.ErrNoState {
-		log.Printf("[TRACE] statemgr.Filesystem: state snapshot is nil")
 		return err
 	}
 
-	s.file = f
-	s.readFile = s.file.DeepCopy()
+	// If this manager has been configured with a separate path for initial
+	// read and we've not written anything yet then we actually need to
+	// read the "readFile" now as well, and use that as our initial file.
+	if !s.written && s.readPath != s.path {
+		log.Printf("[TRACE] statemgr.Filesystem: for initial read, will use snapshot from %s instead", s.readPath)
+
+		var readFile *statefile.File
+
+		readFh, err := os.Open(s.readPath)
+		if err != nil {
+			// It is okay if the file doesn't exist; we'll treat that as a nil file.
+			if !os.IsNotExist(err) {
+				return err
+			}
+			log.Printf("[TRACE] statemgr.Filesystem: initial snapshot file doesn't exist, but that's okay")
+		} else {
+			readFile, err = statefile.Read(readFh)
+			if err != nil {
+				return err
+			}
+		}
+
+		s.file = readFile
+		s.readFile = s.file.DeepCopy()
+		s.backupFile = f.DeepCopy() // backupFile is always what was initially in the output file
+	} else {
+		s.file = f
+		s.readFile = s.file.DeepCopy()
+		s.backupFile = s.file.DeepCopy()
+	}
+
 	if s.file != nil {
 		log.Printf("[TRACE] statemgr.Filesystem: read snapshot with lineage %q serial %d", s.file.Lineage, s.file.Serial)
 	}
